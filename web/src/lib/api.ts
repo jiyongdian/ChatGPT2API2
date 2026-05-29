@@ -1,4 +1,6 @@
 import { httpRequest, request } from "@/lib/request";
+import webConfig from "@/constants/common-env";
+import { getStoredAuthKey } from "@/store/auth";
 
 export type AccountType = string;
 export type AccountStatus = "正常" | "限流" | "异常" | "禁用";
@@ -85,6 +87,7 @@ export type BackupInclude = {
   image_tasks: boolean;
   accounts_snapshot: boolean;
   auth_keys_snapshot: boolean;
+  chat_conversations_snapshot: boolean;
   images: boolean;
 };
 
@@ -929,4 +932,114 @@ export async function unhideGalleryItem(id: string) {
   return httpRequest<{ ok: boolean }>(`/api/gallery/items/${id}/unhide`, {
     method: "POST",
   });
+}
+
+export type ChatStreamMessage = { role: "user" | "assistant" | "system"; content: string };
+export type ChatPersistedMessage = ChatStreamMessage;
+
+export type ChatStreamEvent =
+  | { type: "conversation.id"; conversation_id: string }
+  | { type: "delta"; text: string }
+  | { type: "done" }
+  | { type: "error"; message: string };
+
+export type ChatConversation = {
+  id: string;
+  title: string;
+  messages: ChatPersistedMessage[];
+  upstream_conversation_id: string;
+  created_at: number;
+  updated_at: number;
+};
+
+export async function listChatConversations() {
+  return httpRequest<{ items: ChatConversation[] }>("/api/chat/conversations");
+}
+
+export async function saveChatConversation(payload: {
+  id?: string;
+  title?: string;
+  messages: ChatPersistedMessage[];
+  upstream_conversation_id?: string;
+}) {
+  return httpRequest<{ item: ChatConversation }>("/api/chat/conversations", {
+    method: "POST",
+    body: {
+      ...(payload.id ? { id: payload.id } : {}),
+      title: payload.title ?? "",
+      messages: payload.messages,
+      ...(payload.upstream_conversation_id ? { upstream_conversation_id: payload.upstream_conversation_id } : {}),
+    },
+  });
+}
+
+export async function deleteChatConversation(conversationId: string) {
+  return httpRequest<{ ok: boolean }>(`/api/chat/conversations/${encodeURIComponent(conversationId)}`, {
+    method: "DELETE",
+  });
+}
+
+/**
+ * /api/chat/stream 直读：fetch + ReadableStream 解 SSE。
+ * 不走 axios 是因为 axios 默认全量缓冲，没法做流式增量渲染。
+ * 调用方拿到 AsyncIterable<ChatStreamEvent>，按事件类型自己派发。
+ * abortSignal 透传：用户按"停止生成"时上层 controller.abort() 即可。
+ */
+export async function* streamChat(
+  body: { model: string; messages: ChatStreamMessage[]; conversation_id?: string; force_switch_account?: boolean },
+  abortSignal?: AbortSignal,
+): AsyncGenerator<ChatStreamEvent, void, void> {
+  const authKey = await getStoredAuthKey();
+  const baseUrl = webConfig.apiUrl.replace(/\/$/, "");
+  const response = await fetch(`${baseUrl}/api/chat/stream`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      ...(authKey ? { Authorization: `Bearer ${authKey}` } : {}),
+    },
+    body: JSON.stringify(body),
+    signal: abortSignal,
+  });
+  if (!response.ok || !response.body) {
+    let message = `请求失败 (${response.status})`;
+    try {
+      const payload = await response.json();
+      const detail = payload?.detail ?? payload?.error ?? payload?.message;
+      if (typeof detail === "string" && detail.trim()) message = detail;
+      else if (detail && typeof detail === "object" && typeof detail.error === "string") message = detail.error;
+    } catch {
+      // 非 JSON 错误体走默认 message
+    }
+    throw new Error(message);
+  }
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder("utf-8");
+  let buffer = "";
+  try {
+    while (true) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+      // SSE 用空行分帧；data: 行可能跨 chunk 到达，所以攒到双换行再切。
+      let separator = buffer.indexOf("\n\n");
+      while (separator >= 0) {
+        const frame = buffer.slice(0, separator);
+        buffer = buffer.slice(separator + 2);
+        const dataLine = frame.split("\n").find((line) => line.startsWith("data:"));
+        if (dataLine) {
+          const raw = dataLine.slice(5).trim();
+          if (raw) {
+            try {
+              yield JSON.parse(raw) as ChatStreamEvent;
+            } catch {
+              // 异常 payload 跳过即可，正常流不会落到这里
+            }
+          }
+        }
+        separator = buffer.indexOf("\n\n");
+      }
+    }
+  } finally {
+    try { reader.releaseLock(); } catch { /* noop */ }
+  }
 }

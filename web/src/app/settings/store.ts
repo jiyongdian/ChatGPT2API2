@@ -58,6 +58,7 @@ function normalizeConfig(config: SettingsConfig): SettingsConfig {
         image_tasks: true,
         accounts_snapshot: true,
         auth_keys_snapshot: true,
+        chat_conversations_snapshot: true,
         images: false,
       },
     };
@@ -104,6 +105,7 @@ function normalizeConfig(config: SettingsConfig): SettingsConfig {
         image_tasks: Boolean(backup.include?.image_tasks ?? true),
         accounts_snapshot: Boolean(backup.include?.accounts_snapshot ?? true),
         auth_keys_snapshot: Boolean(backup.include?.auth_keys_snapshot ?? true),
+        chat_conversations_snapshot: Boolean(backup.include?.chat_conversations_snapshot ?? true),
         images: Boolean(backup.include?.images ?? false),
       },
     },
